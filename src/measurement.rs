@@ -1,15 +1,15 @@
 //! Measurement parsing and preprocessing
 
+use crate::types::{LogicPortPins, Metadata};
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-
-use crate::{types::{LogicPortPins, Metadata}};
 
 const ADC_MULTIPLIER: f32 = 1.8 / 163840.;
 const SPIKE_FILTER_ALPHA: f32 = 0.18;
 const SPIKE_FILTER_ALPHA_5: f32 = 0.06;
 const SPIKE_FILTER_SAMPLES: isize = 3;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 /// A single parsed measurement
 pub struct Measurement {
     /// The measured current in mA.
@@ -97,10 +97,7 @@ impl MeasurementAccumulator {
                 self.state.expected_counter.replace(counter);
             }
 
-            buf.push_back(Measurement {
-                micro_amps,
-                pins,
-            })
+            buf.push_back(Measurement { micro_amps, pins })
         }
         self.buf.drain(..end);
         samples_missed
@@ -164,7 +161,6 @@ fn get_adc_result(
     state.prev_range = Some(range);
     adc
 }
-
 
 /// Indicates whether a set of [Measurement]s matched
 #[derive(Debug)]

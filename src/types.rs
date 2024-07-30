@@ -4,6 +4,7 @@ use std::{fmt::Display, num::ParseIntError, str::FromStr};
 
 use crate::{Error, Result};
 use num_enum::{IntoPrimitive, TryFromPrimitive};
+use serde::{Deserialize, Serialize};
 
 /// Error parsing one of the types defined by this crate.
 #[derive(Debug)]
@@ -137,7 +138,7 @@ impl FromStr for DevicePower {
 }
 
 /// Logic level for logic port pins
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub enum Level {
     /// Low level
     Low,
@@ -182,7 +183,7 @@ impl Level {
 }
 
 /// Logic port state
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
 pub struct LogicPortPins {
     pin_levels: [Level; 8],
 }

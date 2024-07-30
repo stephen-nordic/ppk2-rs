@@ -16,6 +16,7 @@ num_enum = "0.5.7"
 serialport = "4.2.0"
 thiserror = "1.0.32"
 tracing = "0.1.36"
+serde = { version = "1.0.160", features = ["derive", "rc"] }
 
 [dev-dependencies]
 anyhow = { version = "1.0.60", features = ["backtrace"] }

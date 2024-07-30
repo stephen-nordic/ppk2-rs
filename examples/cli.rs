@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use ppk2::{
-    types::{DevicePower, MeasurementMode, SourceVoltage, LogicPortPins, Level},
-    Ppk2, try_find_ppk2_port, measurement::MeasurementMatch,
+    measurement::MeasurementMatch,
+    try_find_ppk2_port,
+    types::{DevicePower, Level, LogicPortPins, MeasurementMode, SourceVoltage},
+    Ppk2,
 };
 
 use std::{
