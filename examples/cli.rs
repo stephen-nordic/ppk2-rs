@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 use ppk2::{
-    types::{DevicePower, MeasurementMode, SourceVoltage, LogicPortPins, Level},
-    Ppk2, try_find_ppk2_port, measurement::MeasurementMatch,
+    measurement::MeasurementMatch,
+    try_find_ppk2_port,
+    types::{DevicePower, Level, LogicPortPins, MeasurementMode, SourceVoltage},
+    Ppk2,
 };
 
 use std::{
@@ -89,13 +91,21 @@ fn main() -> Result<()> {
     let pins = LogicPortPins::with_levels(levels);
 
     // Start measuring.
-    let (rx, kill) = ppk2.start_measurement_matching(pins, args.sps)?;
+    let rx = ppk2.start_measurement_matching(pins, args.sps)?;
 
-    // Set up sigkill handler.
-    let mut kill = Some(kill);
-    ctrlc::set_handler(move || {
-        kill.take().unwrap()().unwrap();
-    })?;
+    let ctrlc_handler: Box<dyn FnOnce() -> i32 + Send> = Box::new(move || {
+        info!("Ctrl+C received");
+        let result = ppk2.end_measurements();
+        match result {
+            Ok(_) => 0,
+            Err(e) => {
+                error!("Error ending PPK2 measurements!, {}", e);
+                1
+            }
+        }
+    });
+
+    ctrlc_fnonce::set_ctrlc_handler(ctrlc_handler)?;
 
     // Receive measurements
     let mut count = 0usize;

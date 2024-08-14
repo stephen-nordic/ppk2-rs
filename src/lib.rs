@@ -14,6 +14,7 @@ use std::{
     time::Duration,
 };
 use thiserror::Error;
+use tracing::info;
 use types::{DevicePower, LogicPortPins, MeasurementMode, Metadata, SourceVoltage};
 
 use crate::cmd::Command;
@@ -46,6 +47,8 @@ pub enum Error {
     WorkerSignalError(#[from] TryRecvError),
     #[error("Error deserializeing a measurement: {0:?}")]
     DeserializeMeasurement(Vec<u8>),
+    #[error("Error pausing/resuming measurements")]
+    UsageError(String),
 }
 
 #[allow(missing_docs)]
@@ -55,6 +58,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub struct Ppk2 {
     port: Box<dyn SerialPort>,
     metadata: Metadata,
+
+    ppk2_paused: Option<bool>,
+    sig_kill: Option<mpsc::Sender<()>>,
 }
 
 impl Ppk2 {
@@ -77,6 +83,8 @@ impl Ppk2 {
         let mut ppk2 = Self {
             port,
             metadata: Metadata::default(),
+            sig_kill: None,
+            ppk2_paused: None,
         };
 
         ppk2.metadata = ppk2.get_metadata()?;
@@ -139,10 +147,13 @@ impl Ppk2 {
     /// - [Receiver] of [measurement::MeasurementMatch], and
     /// - A closure that can be called to stop the measurement parsing pipeline and return the
     /// device.
-    pub fn start_measurement(
-        self,
-        sps: usize,
-    ) -> Result<(Receiver<MeasurementMatch>, impl FnOnce() -> Result<Self>)> {
+    pub fn start_measurement(&mut self, sps: usize) -> Result<Receiver<MeasurementMatch>> {
+        if self.sig_kill.is_some() {
+            return Err(Error::UsageError(
+                "Cannot call start_measurement() when a measurement is already active".to_owned(),
+            ));
+        }
+
         self.start_measurement_matching(LogicPortPins::default(), sps)
     }
 
@@ -152,10 +163,16 @@ impl Ppk2 {
     /// - A closure that can be called to stop the measurement parsing pipeline and return the
     /// device.
     pub fn start_measurement_matching(
-        mut self,
+        &mut self,
         pins: LogicPortPins,
         sps: usize,
-    ) -> Result<(Receiver<MeasurementMatch>, impl FnOnce() -> Result<Self>)> {
+    ) -> Result<Receiver<MeasurementMatch>> {
+        if self.sig_kill.is_some() {
+            return Err(Error::UsageError(
+                "Cannot call start_measurement() when a measurement is already active".to_owned(),
+            ));
+        }
+
         // Stuff needed to communicate with the main thread
         // ready allows main thread to signal worker when serial input buf is cleared.
         let ready = Arc::new((Mutex::new(false), Condvar::new()));
@@ -164,12 +181,13 @@ impl Ppk2 {
         // This channel allows the main thread to notify that the worker thread can stop
         // parsing data.
         let (sig_tx, sig_rx) = mpsc::channel::<()>();
+        self.sig_kill = Some(sig_tx);
 
         let task_ready = ready.clone();
         let mut port = self.port.try_clone()?;
         let metadata = self.metadata.clone();
 
-        let t = thread::spawn(move || {
+        thread::spawn(move || {
             let r = || -> Result<()> {
                 // Create an accumulator with the current device metadata
                 let mut accumulator = MeasurementAccumulator::new(metadata);
@@ -193,13 +211,30 @@ impl Ppk2 {
                     // Check whether the main thread has signaled
                     // us to stop
                     match sig_rx.try_recv() {
-                        Ok(_) => return Ok(()),
+                        Ok(_) => {
+                            info!("Kill signal received from parent thread, quitting measurement matching");
+                            return Ok(());
+                        }
                         Err(TryRecvError::Empty) => {}
                         Err(e) => return Err(e.into()),
                     }
 
                     // Now we read chunks and feed them to the accumulator
-                    let n = port.read(&mut buf)?;
+                    let result = match port.read(&mut buf) {
+                        Ok(n) => Ok(n),
+                        Err(e) => match e.kind() {
+                            io::ErrorKind::TimedOut => {
+                                // A timeout is expected when the PPK2 is paused.
+                                // We just continue trying to read until we get some data
+                                // We can't just increase the read timeout, because then
+                                // we will just block and kill signals will be missed
+                                continue;
+                            }
+                            _ => Err(e),
+                        },
+                    };
+                    let n = result?;
+
                     missed += accumulator.feed_into(&buf[..n], &mut measurement_buf);
                     let len = measurement_buf.len();
                     if len >= SPS_MAX / sps {
@@ -223,21 +258,77 @@ impl Ppk2 {
         cvar.notify_all();
 
         self.send_command(Command::AverageStart)?;
+        self.ppk2_paused = Some(false);
 
-        let stop = move || {
-            sig_tx.send(())?;
-            t.join().expect("Data receive thread panicked")?;
-            self.send_command(Command::AverageStop)?;
-            Ok(self)
-        };
-
-        Ok((meas_rx, stop))
+        Ok(meas_rx)
     }
 
     /// Reset the device, making the device unusable.
     pub fn reset(mut self) -> Result<()> {
         self.send_command(Command::Reset)?;
         Ok(())
+    }
+
+    /// Stop measurements. Can only be called after starting
+    /// measurements. You will need to call start_measurement()
+    /// or start_measurement_matching to be able to start measurements
+    /// again.
+    pub fn end_measurements(&mut self) -> Result<()> {
+        self.send_command(Command::AverageStop)?;
+        self.ppk2_paused = None;
+
+        match &self.sig_kill {
+            None => {
+                return Err(Error::UsageError(
+                    "Can't end measurements when it was not started".to_owned(),
+                ))
+            }
+            Some(sig_kill) => {
+                sig_kill.send(())?;
+            }
+        }
+
+        self.sig_kill = None;
+
+        Ok(())
+    }
+
+    /// Resume PPK2 measurements
+    /// The PPK2 must already be started with
+    /// start_measurement_matching() (or) start_measurement()
+    /// and later paused to be able to use this function
+    pub fn resume_measurements(&mut self) -> Result<()> {
+        if self.ppk2_paused.is_none() {
+            return Err(Error::UsageError(
+                "Can't command PPK2 resume measurements without starting measurements first!"
+                    .to_owned(),
+            ));
+        }
+        self.send_command(Command::AverageStart)?;
+        self.ppk2_paused = Some(false);
+        Ok(())
+    }
+
+    /// Pause PPK2 measurements
+    /// The PPK2 must already be started with
+    /// start_measurement_matching() (or) start_measurement()
+    /// before it can be paused
+    pub fn pause_measurements(&mut self) -> Result<()> {
+        if self.ppk2_paused.is_none() {
+            return Err(Error::UsageError(
+                "Can't command PPK2 pause measurements without starting measurements first!"
+                    .to_owned(),
+            ));
+        }
+        self.send_command(Command::AverageStop)?;
+        self.ppk2_paused = Some(true);
+        Ok(())
+    }
+
+    /// Check if the PPK2 has been paused by the user
+    /// None if the PPK2 was never started
+    pub fn is_paused(&self) -> Option<bool> {
+        self.ppk2_paused
     }
 
     fn set_power_mode(&mut self, mode: MeasurementMode) -> Result<()> {
